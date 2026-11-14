@@ -203,13 +203,6 @@
       signOut = authMod.signOut;
       onAuthStateChanged = authMod.onAuthStateChanged;
 
-      // Complete any pending redirect sign-in cleanly
-      try {
-        await authMod.getRedirectResult(auth);
-      } catch (redirErr) {
-        console.warn('Redirect sign-in check:', redirErr);
-      }
-
       collection = fsMod.collection;
       doc = fsMod.doc;
       getDocFromServer = fsMod.getDocFromServer;
@@ -223,6 +216,11 @@
       writeBatch = fsMod.writeBatch;
       serverTimestamp = fsMod.serverTimestamp;
       cloudAvailable = true;
+
+      // Complete any pending redirect sign-in without blocking app boot
+      void authMod.getRedirectResult(auth).catch((redirErr) => {
+        console.warn('Redirect sign-in check:', redirErr);
+      });
     } catch (bootErr) {
       console.warn('Cloud SDK bootstrap fell back to local mode:', bootErr);
     }
@@ -279,7 +277,7 @@
       }
       const provider = new GoogleAuthProviderClass();
       provider.setCustomParameters({ prompt: 'select_account' });
-      return signInWithPopup(auth, provider, browserPopupRedirectResolver);
+      return signInWithPopup(auth, provider);
     }
 
     async function signInWithGoogleRedirect() {
@@ -1351,13 +1349,15 @@
         const rawMsg = err instanceof Error ? err.message : String(err || 'Google sign-in failed.');
         const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
         const isEmbedded = typeof window !== 'undefined' && window.self !== window.top;
+        console.error('Google Sign-In Error:', code, rawMsg);
 
         if (code === 'auth/unauthorized-domain' || rawMsg.includes('unauthorized-domain')) {
           setGoogleAuthIssue({
             type: 'unauthorized-domain',
+            code: code || 'auth/unauthorized-domain',
             hostname,
-            title: 'Domain Authorization Required',
-            detail: `Domain "${hostname}" is not yet added to Firebase Authorized Domains. Add it once in Firebase Console → Authentication → Settings → Authorized domains, or sign in via the AI Studio app link / Admin Credentials below.`,
+            title: 'Domain Not Authorized for Google Sign-In',
+            detail: `Current domain "${hostname}" is not in Firebase Authorized Domains yet. Copy "${hostname}" and add it in Firebase Console → Authentication → Settings → Authorized domains, OR open the live AI Studio app URL.`,
           });
         } else if (
           code === 'auth/popup-closed-by-user' ||
@@ -1369,19 +1369,21 @@
         ) {
           setGoogleAuthIssue({
             type: 'popup-closed',
+            code: code || 'auth/popup-closed-by-user',
             hostname,
             isEmbedded,
             title: 'Google Popup Closed Before Completing',
             detail: isEmbedded
-              ? 'Browser iframe security closed the Firebase popup. Use "Direct Google Sign-In" or open this app in a full browser tab.'
-              : 'Your browser blocked or closed the Firebase popup window. Use "Direct Google Sign-In" or "Google Redirect Login" below.',
+              ? 'This preview runs inside an embedded frame where Chrome may block cross-site sign-in popups. Click "Open App in Full Tab" below and sign in with Google there.'
+              : 'Your browser closed or blocked the sign-in popup window. Click "Google Redirect Login" below (no popup needed) or allow popups for this site.',
           });
         } else {
           setGoogleAuthIssue({
             type: 'other',
+            code: code || 'auth/error',
             hostname,
             isEmbedded,
-            title: 'Google Sign-In Could Not Complete',
+            title: 'Google Sign-In Error',
             detail: rawMsg,
           });
         }
@@ -1391,27 +1393,10 @@
         setCloudBusy(true);
         setLoginError('');
         setGoogleAuthIssue(null);
-        const isEmbedded = typeof window !== 'undefined' && window.self !== window.top;
-        const hasGis = typeof window !== 'undefined' && Boolean(window.google?.accounts?.oauth2);
         try {
-          // Inside an iframe (like AI Studio preview), GIS avoids Firebase's cross-origin __/auth/iframe cookie partitioning
-          const result = (isEmbedded && hasGis && C.signInWithGoogleGIS)
-            ? await C.signInWithGoogleGIS()
-            : await (C.signInWithGooglePopup ? C.signInWithGooglePopup() : C.signInWithPopup(C.auth, C.googleProvider));
-          handleGoogleAuthSuccess(result);
-        } catch (err) {
-          handleGoogleAuthFailure(err);
-        } finally {
-          setCloudBusy(false);
-        }
-      };
-
-      const handleGoogleDirectGIS = async () => {
-        setCloudBusy(true);
-        setLoginError('');
-        setGoogleAuthIssue(null);
-        try {
-          const result = await C.signInWithGoogleGIS();
+          const result = await (C.signInWithGooglePopup
+            ? C.signInWithGooglePopup()
+            : C.signInWithPopup(C.auth, C.googleProvider));
           handleGoogleAuthSuccess(result);
         } catch (err) {
           handleGoogleAuthFailure(err);
@@ -1562,28 +1547,63 @@
 
                 {googleAuthIssue && (
                   <div role="alert" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs text-amber-900 space-y-2.5">
-                    <p className="font-bold text-amber-950">{googleAuthIssue.title}</p>
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-bold text-amber-950">{googleAuthIssue.title}</p>
+                      {googleAuthIssue.code && (
+                        <span className="rounded bg-amber-200/70 px-1.5 py-0.5 font-mono text-[10px] text-amber-950">{googleAuthIssue.code}</span>
+                      )}
+                    </div>
                     <p className="leading-relaxed text-amber-800">{googleAuthIssue.detail}</p>
                     <div className="flex flex-wrap gap-2">
                       {googleAuthIssue.type === 'unauthorized-domain' ? (
-                        <a
-                          href={`https://console.firebase.google.com/project/${C.projectId || 'prismatic-edition-ntvkm'}/authentication/settings`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
-                        >
-                          Authorize Domain in Firebase Console
-                        </a>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (googleAuthIssue.hostname && navigator.clipboard) {
+                                navigator.clipboard.writeText(googleAuthIssue.hostname);
+                              }
+                            }}
+                            className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
+                          >
+                            Copy "{googleAuthIssue.hostname}"
+                          </button>
+                          <a
+                            href={`https://console.firebase.google.com/project/${C.projectId || 'prismatic-edition-ntvkm'}/authentication/settings`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
+                          >
+                            Open Firebase Authorized Domains
+                          </a>
+                          <a
+                            href="https://ais-pre-dunm2vf2yybsxriiffmio7-596917347340.asia-east1.run.app"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
+                          >
+                            Open Authorized App Link
+                          </a>
+                        </>
                       ) : (
                         <>
-                          {window.google?.accounts?.oauth2 && (
+                          {typeof window !== 'undefined' && window.self !== window.top ? (
+                            <a
+                              href={typeof window !== 'undefined' ? window.location.href : '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
+                            >
+                              Open App in Full Tab
+                            </a>
+                          ) : (
                             <button
                               type="button"
                               disabled={cloudBusy}
-                              onClick={handleGoogleDirectGIS}
+                              onClick={handleGoogleRedirectLogin}
                               className="rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
                             >
-                              Direct Google Sign-In
+                              Google Redirect Login (No Popup)
                             </button>
                           )}
                           <button
@@ -1592,27 +1612,8 @@
                             onClick={handleGoogleFirebasePopup}
                             className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
                           >
-                            Retry Firebase Popup
+                            Retry Google Popup
                           </button>
-                          {typeof window !== 'undefined' && window.self === window.top ? (
-                            <button
-                              type="button"
-                              disabled={cloudBusy}
-                              onClick={handleGoogleRedirectLogin}
-                              className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
-                            >
-                              Google Redirect Login
-                            </button>
-                          ) : (
-                            <a
-                              href={typeof window !== 'undefined' ? window.location.href : '#'}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
-                            >
-                              Open App in Full Tab
-                            </a>
-                          )}
                         </>
                       )}
                     </div>
