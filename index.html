@@ -18,6 +18,8 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <!-- Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Google Identity Services (fallback OAuth popup when iframe COOP blocks Firebase popup handler) -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <!-- Custom Font -->
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
@@ -139,6 +141,11 @@
     let cloudAvailable = false;
 
     let signInWithPopup = async () => { throw new Error('Cloud sync unavailable in offline/static mode.'); };
+    let signInWithRedirect = async () => { throw new Error('Cloud sync unavailable in offline/static mode.'); };
+    let getRedirectResult = async () => null;
+    let signInWithCredential = async () => { throw new Error('Cloud sync unavailable in offline/static mode.'); };
+    let GoogleAuthProviderClass = null;
+    let browserPopupRedirectResolver = undefined;
     let signInWithEmailAndPassword = async () => { throw new Error('Cloud Auth unavailable.'); };
     let signOut = async () => {};
     let onAuthStateChanged = (_authObj, cb) => {
@@ -173,16 +180,35 @@
         8000
       );
 
-      app = appMod.initializeApp(firebaseConfig);
+      app = appMod.initializeApp({
+        apiKey: firebaseConfig.apiKey,
+        authDomain: firebaseConfig.authDomain,
+        projectId: firebaseConfig.projectId,
+        storageBucket: firebaseConfig.storageBucket,
+        messagingSenderId: firebaseConfig.messagingSenderId,
+        appId: firebaseConfig.appId,
+      });
       db = fsMod.getFirestore(app, firebaseConfig.firestoreDatabaseId);
       auth = authMod.getAuth(app);
+      GoogleAuthProviderClass = authMod.GoogleAuthProvider;
+      browserPopupRedirectResolver = authMod.browserPopupRedirectResolver;
       googleProvider = new authMod.GoogleAuthProvider();
       googleProvider.setCustomParameters({ prompt: 'select_account' });
 
       signInWithPopup = authMod.signInWithPopup;
+      signInWithRedirect = authMod.signInWithRedirect;
+      getRedirectResult = authMod.getRedirectResult;
+      signInWithCredential = authMod.signInWithCredential;
       signInWithEmailAndPassword = authMod.signInWithEmailAndPassword;
       signOut = authMod.signOut;
       onAuthStateChanged = authMod.onAuthStateChanged;
+
+      // Complete any pending redirect sign-in cleanly
+      try {
+        await authMod.getRedirectResult(auth);
+      } catch (redirErr) {
+        console.warn('Redirect sign-in check:', redirErr);
+      }
 
       collection = fsMod.collection;
       doc = fsMod.doc;
@@ -246,6 +272,65 @@
       }
     }
     if (cloudAvailable) void testConnection();
+
+    async function signInWithGooglePopup() {
+      if (!cloudAvailable || !GoogleAuthProviderClass) {
+        throw new Error('Cloud Auth unavailable right now.');
+      }
+      const provider = new GoogleAuthProviderClass();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      return signInWithPopup(auth, provider, browserPopupRedirectResolver);
+    }
+
+    async function signInWithGoogleRedirect() {
+      if (!cloudAvailable || !GoogleAuthProviderClass) {
+        throw new Error('Cloud Auth unavailable right now.');
+      }
+      const provider = new GoogleAuthProviderClass();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      return signInWithRedirect(auth, provider);
+    }
+
+    function signInWithGoogleGIS() {
+      return new Promise((resolve, reject) => {
+        if (!cloudAvailable || !GoogleAuthProviderClass) {
+          reject(new Error('Cloud Auth unavailable right now.'));
+          return;
+        }
+        const oauth2 = window.google?.accounts?.oauth2;
+        if (!oauth2 || !firebaseConfig.oAuthClientId) {
+          reject(new Error('Google Identity Services script is still loading or blocked.'));
+          return;
+        }
+        try {
+          const client = oauth2.initTokenClient({
+            client_id: firebaseConfig.oAuthClientId,
+            scope: 'openid email profile',
+            prompt: 'select_account',
+            callback: async (tokenResponse) => {
+              if (!tokenResponse || tokenResponse.error || !tokenResponse.access_token) {
+                reject(new Error(tokenResponse?.error_description || tokenResponse?.error || 'Google sign-in did not return an access token.'));
+                return;
+              }
+              try {
+                const credential = GoogleAuthProviderClass.credential(null, tokenResponse.access_token);
+                const userCred = await signInWithCredential(auth, credential);
+                resolve(userCred);
+              } catch (credErr) {
+                reject(credErr);
+              }
+            },
+            error_callback: (err) => {
+              const errType = err?.type || 'popup_failed';
+              reject(new Error(errType === 'popup_closed' ? 'auth/popup-closed-by-user' : `Google OAuth (${errType})`));
+            },
+          });
+          client.requestAccessToken();
+        } catch (initErr) {
+          reject(initErr);
+        }
+      });
+    }
 
     async function syncEntityToSql(entity, id, payload) {
       try {
@@ -870,8 +955,11 @@
 
     window.__CLOUD__ = {
       cloudAvailable,
+      projectId: firebaseConfig.projectId,
       app, db, auth, googleProvider,
-      signInWithPopup, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+      signInWithPopup, signInWithRedirect, getRedirectResult, signInWithCredential,
+      signInWithGooglePopup, signInWithGoogleRedirect, signInWithGoogleGIS,
+      signInWithEmailAndPassword, signOut, onAuthStateChanged,
       collection, doc, onSnapshot, query, limit, getDocs, getDocFromServer,
       setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp,
       LOGO_URL, DEFAULT_DISH_IMAGE_URL, DEFAULT_AVATAR_URL, fallbackImgSrc,
@@ -972,6 +1060,7 @@
       const [loginEmail, setLoginEmail] = useState('');
       const [loginPassword, setLoginPassword] = useState('');
       const [loginError, setLoginError] = useState('');
+      const [googleAuthIssue, setGoogleAuthIssue] = useState(null);
       const [cloudBusy, setCloudBusy] = useState(false);
       const [cloudError, setCloudError] = useState('');
       const [syncBannerDismissed, setSyncBannerDismissed] = useState(false);
@@ -1247,17 +1336,111 @@
         setNotifications((prev) => prev.map((n) => ({ ...n, unread: false })));
       };
 
+      const handleGoogleAuthSuccess = (result) => {
+        if (result?.user) {
+          setFirebaseUser(result.user);
+        }
+        setGoogleAuthIssue(null);
+        setLoginError('');
+        setIsAuthenticated(true);
+        showToast('Google Cloud Sync connected across laptops!', 'success');
+      };
+
+      const handleGoogleAuthFailure = (err) => {
+        const code = err?.code || '';
+        const rawMsg = err instanceof Error ? err.message : String(err || 'Google sign-in failed.');
+        const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
+        const isEmbedded = typeof window !== 'undefined' && window.self !== window.top;
+
+        if (code === 'auth/unauthorized-domain' || rawMsg.includes('unauthorized-domain')) {
+          setGoogleAuthIssue({
+            type: 'unauthorized-domain',
+            hostname,
+            title: 'Domain Authorization Required',
+            detail: `Domain "${hostname}" is not yet added to Firebase Authorized Domains. Add it once in Firebase Console → Authentication → Settings → Authorized domains, or sign in via the AI Studio app link / Admin Credentials below.`,
+          });
+        } else if (
+          code === 'auth/popup-closed-by-user' ||
+          code === 'auth/cancelled-popup-request' ||
+          code === 'auth/popup-blocked' ||
+          code === 'auth/internal-error' ||
+          rawMsg.includes('popup-closed') ||
+          rawMsg.includes('popup_closed')
+        ) {
+          setGoogleAuthIssue({
+            type: 'popup-closed',
+            hostname,
+            isEmbedded,
+            title: 'Google Popup Closed Before Completing',
+            detail: isEmbedded
+              ? 'Browser iframe security closed the Firebase popup. Use "Direct Google Sign-In" or open this app in a full browser tab.'
+              : 'Your browser blocked or closed the Firebase popup window. Use "Direct Google Sign-In" or "Google Redirect Login" below.',
+          });
+        } else {
+          setGoogleAuthIssue({
+            type: 'other',
+            hostname,
+            isEmbedded,
+            title: 'Google Sign-In Could Not Complete',
+            detail: rawMsg,
+          });
+        }
+      };
+
       const handleGoogleLogin = async () => {
         setCloudBusy(true);
         setLoginError('');
+        setGoogleAuthIssue(null);
+        const isEmbedded = typeof window !== 'undefined' && window.self !== window.top;
+        const hasGis = typeof window !== 'undefined' && Boolean(window.google?.accounts?.oauth2);
         try {
-          await C.signInWithPopup(C.auth, C.googleProvider);
-          setIsAuthenticated(true);
-          showToast('Google Cloud Sync connected across laptops!', 'success');
+          // Inside an iframe (like AI Studio preview), GIS avoids Firebase's cross-origin __/auth/iframe cookie partitioning
+          const result = (isEmbedded && hasGis && C.signInWithGoogleGIS)
+            ? await C.signInWithGoogleGIS()
+            : await (C.signInWithGooglePopup ? C.signInWithGooglePopup() : C.signInWithPopup(C.auth, C.googleProvider));
+          handleGoogleAuthSuccess(result);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : 'Google sign-in failed.';
-          setLoginError(msg.includes('popup-closed') ? 'Sign-in popup was closed.' : msg);
+          handleGoogleAuthFailure(err);
         } finally {
+          setCloudBusy(false);
+        }
+      };
+
+      const handleGoogleDirectGIS = async () => {
+        setCloudBusy(true);
+        setLoginError('');
+        setGoogleAuthIssue(null);
+        try {
+          const result = await C.signInWithGoogleGIS();
+          handleGoogleAuthSuccess(result);
+        } catch (err) {
+          handleGoogleAuthFailure(err);
+        } finally {
+          setCloudBusy(false);
+        }
+      };
+
+      const handleGoogleFirebasePopup = async () => {
+        setCloudBusy(true);
+        setLoginError('');
+        setGoogleAuthIssue(null);
+        try {
+          const result = await C.signInWithGooglePopup();
+          handleGoogleAuthSuccess(result);
+        } catch (err) {
+          handleGoogleAuthFailure(err);
+        } finally {
+          setCloudBusy(false);
+        }
+      };
+
+      const handleGoogleRedirectLogin = async () => {
+        setCloudBusy(true);
+        setLoginError('');
+        try {
+          await C.signInWithGoogleRedirect();
+        } catch (err) {
+          handleGoogleAuthFailure(err);
           setCloudBusy(false);
         }
       };
@@ -1332,8 +1515,8 @@
 
       if (!isAuthenticated) {
         return (
-          <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 sm:p-8 overflow-y-auto">
-            <div className="w-full max-w-5xl overflow-hidden rounded-3xl bg-white shadow-2xl lg:grid lg:grid-cols-2">
+          <div className="fixed inset-0 z-40 bg-slate-950 flex items-start sm:items-center justify-center p-4 sm:p-8 overflow-y-auto">
+            <div className="w-full max-w-5xl my-auto overflow-hidden rounded-3xl bg-white shadow-2xl lg:grid lg:grid-cols-2">
               <section className="relative hidden min-h-[600px] flex-col justify-between overflow-hidden bg-gradient-to-br from-orange-500 via-orange-600 to-rose-700 p-10 text-white lg:flex">
                 <div className="absolute -right-24 -top-24 h-80 w-80 rounded-full border-[40px] border-white/10"></div>
                 <div className="absolute -bottom-28 -left-20 h-80 w-80 rounded-full bg-white/10 blur-2xl"></div>
@@ -1371,13 +1554,72 @@
                   type="button"
                   disabled={cloudBusy}
                   onClick={handleGoogleLogin}
-                  className="mb-5 flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-bold text-slate-800 shadow-sm transition hover:border-orange-400 hover:bg-orange-50 disabled:opacity-60"
+                  className="mb-3 flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-bold text-slate-800 shadow-sm transition hover:border-orange-400 hover:bg-orange-50 disabled:opacity-60"
                 >
                   <Icon name="cloud" className="w-4 h-4 text-orange-600" />
                   {cloudBusy ? 'Connecting to Cloud...' : 'Sign in with Google (Live Multi-Laptop Sync)'}
                 </button>
 
-                <div className="relative mb-5 flex items-center">
+                {googleAuthIssue && (
+                  <div role="alert" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs text-amber-900 space-y-2.5">
+                    <p className="font-bold text-amber-950">{googleAuthIssue.title}</p>
+                    <p className="leading-relaxed text-amber-800">{googleAuthIssue.detail}</p>
+                    <div className="flex flex-wrap gap-2">
+                      {googleAuthIssue.type === 'unauthorized-domain' ? (
+                        <a
+                          href={`https://console.firebase.google.com/project/${C.projectId || 'prismatic-edition-ntvkm'}/authentication/settings`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
+                        >
+                          Authorize Domain in Firebase Console
+                        </a>
+                      ) : (
+                        <>
+                          {window.google?.accounts?.oauth2 && (
+                            <button
+                              type="button"
+                              disabled={cloudBusy}
+                              onClick={handleGoogleDirectGIS}
+                              className="rounded-lg bg-orange-500 px-3 py-1.5 font-bold text-white hover:bg-orange-600 transition"
+                            >
+                              Direct Google Sign-In
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={cloudBusy}
+                            onClick={handleGoogleFirebasePopup}
+                            className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
+                          >
+                            Retry Firebase Popup
+                          </button>
+                          {typeof window !== 'undefined' && window.self === window.top ? (
+                            <button
+                              type="button"
+                              disabled={cloudBusy}
+                              onClick={handleGoogleRedirectLogin}
+                              className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
+                            >
+                              Google Redirect Login
+                            </button>
+                          ) : (
+                            <a
+                              href={typeof window !== 'undefined' ? window.location.href : '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-bold text-amber-900 hover:bg-amber-100 transition"
+                            >
+                              Open App in Full Tab
+                            </a>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="relative mb-5 mt-2 flex items-center">
                   <div className="flex-grow border-t border-slate-200"></div>
                   <span className="mx-3 flex-shrink text-[11px] font-bold uppercase tracking-wider text-slate-400">Or Admin Credentials</span>
                   <div className="flex-grow border-t border-slate-200"></div>
