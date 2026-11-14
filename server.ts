@@ -18,6 +18,11 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  app.use((_req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    next();
+  });
+
   app.use(express.json({ limit: '2mb' }));
 
   app.get('/api/health', (_req, res) => {

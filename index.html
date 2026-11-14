@@ -146,6 +146,8 @@
     let signInWithCredential = async () => { throw new Error('Cloud sync unavailable in offline/static mode.'); };
     let GoogleAuthProviderClass = null;
     let browserPopupRedirectResolver = undefined;
+    let redirectResultPromise = Promise.resolve(null);
+    let googlePopupPromise = null;
     let signInWithEmailAndPassword = async () => { throw new Error('Cloud Auth unavailable.'); };
     let signOut = async () => {};
     let onAuthStateChanged = (_authObj, cb) => {
@@ -217,10 +219,8 @@
       serverTimestamp = fsMod.serverTimestamp;
       cloudAvailable = true;
 
-      // Complete any pending redirect sign-in without blocking app boot
-      void authMod.getRedirectResult(auth).catch((redirErr) => {
-        console.warn('Redirect sign-in check:', redirErr);
-      });
+      // Complete any pending redirect sign-in and expose promise for App diagnostics
+      redirectResultPromise = authMod.getRedirectResult(auth);
     } catch (bootErr) {
       console.warn('Cloud SDK bootstrap fell back to local mode:', bootErr);
     }
@@ -275,9 +275,24 @@
       if (!cloudAvailable || !GoogleAuthProviderClass) {
         throw new Error('Cloud Auth unavailable right now.');
       }
+      if (!firebaseConfig.apiKey || !firebaseConfig.authDomain) {
+        throw new Error('Firebase authDomain or apiKey is missing from firebaseConfig.');
+      }
+      if (googlePopupPromise) {
+        return googlePopupPromise;
+      }
       const provider = new GoogleAuthProviderClass();
+      provider.addScope('email');
+      provider.addScope('profile');
       provider.setCustomParameters({ prompt: 'select_account' });
-      return signInWithPopup(auth, provider);
+      googlePopupPromise = (
+        browserPopupRedirectResolver
+          ? signInWithPopup(auth, provider, browserPopupRedirectResolver)
+          : signInWithPopup(auth, provider)
+      ).finally(() => {
+        googlePopupPromise = null;
+      });
+      return googlePopupPromise;
     }
 
     async function signInWithGoogleRedirect() {
@@ -285,8 +300,12 @@
         throw new Error('Cloud Auth unavailable right now.');
       }
       const provider = new GoogleAuthProviderClass();
+      provider.addScope('email');
+      provider.addScope('profile');
       provider.setCustomParameters({ prompt: 'select_account' });
-      return signInWithRedirect(auth, provider);
+      return browserPopupRedirectResolver
+        ? signInWithRedirect(auth, provider, browserPopupRedirectResolver)
+        : signInWithRedirect(auth, provider);
     }
 
     function signInWithGoogleGIS() {
@@ -954,7 +973,9 @@
     window.__CLOUD__ = {
       cloudAvailable,
       projectId: firebaseConfig.projectId,
+      authDomain: firebaseConfig.authDomain,
       app, db, auth, googleProvider,
+      redirectResultPromise,
       signInWithPopup, signInWithRedirect, getRedirectResult, signInWithCredential,
       signInWithGooglePopup, signInWithGoogleRedirect, signInWithGoogleGIS,
       signInWithEmailAndPassword, signOut, onAuthStateChanged,
@@ -1123,6 +1144,20 @@
       // --- FIREBASE AUTH LISTENER ---
       useEffect(() => {
         const safetyTimer = setTimeout(() => setAuthChecked(true), 2500);
+        if (C.redirectResultPromise && typeof C.redirectResultPromise.then === 'function') {
+          C.redirectResultPromise
+            .then((res) => {
+              if (res?.user) {
+                setFirebaseUser(res.user);
+                setGoogleAuthIssue(null);
+                setIsAuthenticated(true);
+              }
+            })
+            .catch((redirErr) => {
+              console.warn('Redirect sign-in result error:', redirErr);
+              handleGoogleAuthFailure(redirErr);
+            });
+        }
         const unsub = C.onAuthStateChanged(C.auth, (user) => {
           clearTimeout(safetyTimer);
           setFirebaseUser(user);
@@ -1349,33 +1384,72 @@
         const rawMsg = err instanceof Error ? err.message : String(err || 'Google sign-in failed.');
         const hostname = typeof window !== 'undefined' ? window.location.hostname : '';
         const isEmbedded = typeof window !== 'undefined' && window.self !== window.top;
-        console.error('Google Sign-In Error:', code, rawMsg);
+        console.error('Google Sign-In Error:', { code, message: rawMsg, authDomain: C.authDomain, hostname, isEmbedded });
 
         if (code === 'auth/unauthorized-domain' || rawMsg.includes('unauthorized-domain')) {
           setGoogleAuthIssue({
             type: 'unauthorized-domain',
             code: code || 'auth/unauthorized-domain',
             hostname,
+            isEmbedded,
             title: 'Domain Not Authorized for Google Sign-In',
             detail: `Current domain "${hostname}" is not in Firebase Authorized Domains yet. Copy "${hostname}" and add it in Firebase Console → Authentication → Settings → Authorized domains, OR open the live AI Studio app URL.`,
           });
+        } else if (code === 'auth/popup-blocked' || rawMsg.includes('popup-blocked')) {
+          setGoogleAuthIssue({
+            type: 'popup-blocked',
+            code: 'auth/popup-blocked',
+            hostname,
+            isEmbedded,
+            title: 'Sign-In Popup Blocked by Browser',
+            detail: isEmbedded
+              ? 'Your browser blocked the Google sign-in popup inside this embedded preview. Allow popups for this site or click "Open App in Full Tab" below.'
+              : 'Your browser blocked the Google sign-in popup window. Allow popups for this site in your address bar, or use "Google Redirect Login (No Popup)" below.',
+          });
+          setLoginError('Browser blocked the Google sign-in popup. Please allow popups or use the fallback option above.');
         } else if (
           code === 'auth/popup-closed-by-user' ||
-          code === 'auth/cancelled-popup-request' ||
-          code === 'auth/popup-blocked' ||
-          code === 'auth/internal-error' ||
+          rawMsg.includes('popup-closed-by-user') ||
           rawMsg.includes('popup-closed') ||
           rawMsg.includes('popup_closed')
         ) {
           setGoogleAuthIssue({
             type: 'popup-closed',
-            code: code || 'auth/popup-closed-by-user',
+            code: 'auth/popup-closed-by-user',
             hostname,
             isEmbedded,
-            title: 'Google Popup Closed Before Completing',
+            title: 'Google Sign-In Window Closed Before Completion',
             detail: isEmbedded
-              ? 'This preview runs inside an embedded frame where Chrome may block cross-site sign-in popups. Click "Open App in Full Tab" below and sign in with Google there.'
-              : 'Your browser closed or blocked the sign-in popup window. Click "Google Redirect Login" below (no popup needed) or allow popups for this site.',
+              ? 'The sign-in popup was closed before completing (browsers often close cross-origin OAuth popups inside embedded previews). Click "Open App in Full Tab" to sign in cleanly, or try again.'
+              : 'The Google sign-in popup was closed before finishing authentication. Please click "Retry Google Popup" and keep the window open until your account is selected, or use "Google Redirect Login (No Popup)".',
+          });
+          setLoginError('Google sign-in popup closed before completing. Please retry or use the fallback option above.');
+        } else if (code === 'auth/cancelled-popup-request' || rawMsg.includes('cancelled-popup-request')) {
+          setGoogleAuthIssue({
+            type: 'popup-cancelled',
+            code: 'auth/cancelled-popup-request',
+            hostname,
+            isEmbedded,
+            title: 'Previous Sign-In Popup Cancelled',
+            detail: 'Another Google sign-in popup request superseded this one. Please click once and wait for the Google account chooser.',
+          });
+        } else if (code === 'auth/operation-not-allowed' || rawMsg.includes('operation-not-allowed')) {
+          setGoogleAuthIssue({
+            type: 'operation-not-allowed',
+            code: 'auth/operation-not-allowed',
+            hostname,
+            isEmbedded,
+            title: 'Google Sign-In Provider Not Enabled',
+            detail: 'Enable the Google Sign-In provider in Firebase Console → Authentication → Sign-in method.',
+          });
+        } else if (code === 'auth/network-request-failed' || rawMsg.includes('network-request-failed')) {
+          setGoogleAuthIssue({
+            type: 'network-error',
+            code: 'auth/network-request-failed',
+            hostname,
+            isEmbedded,
+            title: 'Network Error During Google Sign-In',
+            detail: 'Could not reach Firebase Authentication servers. Check your internet connection or VPN/ad-blocker and try again.',
           });
         } else {
           setGoogleAuthIssue({
@@ -1386,6 +1460,7 @@
             title: 'Google Sign-In Error',
             detail: rawMsg,
           });
+          setLoginError(rawMsg);
         }
       };
 
