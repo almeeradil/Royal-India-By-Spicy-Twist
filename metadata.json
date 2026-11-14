@@ -1,0 +1,6 @@
+{
+  "name": "Royal India By Spicy Twist",
+  "description": "Multi-branch cloud-synced restaurant management, POS, and Kitchen Display System (KDS) in PKR.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
